@@ -1,0 +1,17 @@
+{
+  "name": "cloudways-status-discord",
+  "version": "1.0.0",
+  "private": true,
+  "description": "24/7 Cloudways Statuspage monitor with Discord webhook notifications.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "echo Build complete",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
