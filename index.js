@@ -469,6 +469,78 @@ app.get("/status", (_req, res) => {
   res.json(latestStatus);
 });
 
+app.get("/test-discord", async (_req, res) => {
+  try {
+    const testPayload = {
+      username: "Cloudways Status",
+      embeds: [
+        {
+          title: "🧪 Cloudways Status Monitor Test",
+          description:
+            "Discord webhook is working correctly. This is a temporary test notification.",
+          color: 0x5865f2,
+          fields: [
+            {
+              name: "Monitor",
+              value: "Online",
+              inline: true
+            },
+            {
+              name: "Cloudways Status",
+              value: latestStatus.overall ?? "Unknown",
+              inline: true
+            },
+            {
+              name: "Poll Interval",
+              value: "30 seconds",
+              inline: true
+            }
+          ],
+          footer: {
+            text: "Cloudways Status Monitor"
+          },
+          timestamp: new Date().toISOString()
+        }
+      ],
+      allowed_mentions: {
+        parse: []
+      }
+    };
+
+    const response = await fetch(`${DISCORD_WEBHOOK_URL}?wait=true`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "cloudways-status-discord/1.0.0"
+      },
+      body: JSON.stringify(testPayload)
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+
+      return res.status(502).json({
+        success: false,
+        error: `Discord returned HTTP ${response.status}`,
+        details: body
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Test Discord notification sent.",
+      cloudwaysStatus: latestStatus.overall
+    });
+  } catch (error) {
+    console.error("Test Discord notification failed:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
 app.listen(PORT, "0.0.0.0", async () => {
   console.log(`Cloudways Status Monitor started on port ${PORT}`);
   console.log(`Polling Cloudways every ${POLL_INTERVAL_MS / 1000} seconds`);
