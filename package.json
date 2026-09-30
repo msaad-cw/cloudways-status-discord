@@ -1,13 +1,14 @@
 {
   "name": "cloudways-status-discord",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Diagnostic Node.js monitor for the public Cloudways Statuspage API.",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "scripts": {
+    "build": "echo Build complete",
     "start": "node index.js"
   },
   "dependencies": {}
