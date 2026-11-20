@@ -5,15 +5,38 @@ const PORT = process.env.PORT || 3000;
 
 const STATUS_URL = "https://status.cloudways.com/api/v2/summary.json";
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const POLL_INTERVAL_MS = 30_000;
+const TEST_TOKEN = process.env.TEST_TOKEN || null;
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 60_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+const USER_AGENT = "cloudways-status-discord/1.1.0";
+
+// On startup, incidents/maintenance updated within this window are announced
+// instead of silently absorbed into the baseline, so events that happen while
+// the app is restarting or redeploying are not lost.
+const STARTUP_LOOKBACK_MS =
+  (Number(process.env.STARTUP_LOOKBACK_MINUTES) || 15) * 60_000;
+
+// Discord embed limits (description max is 4096).
+const MAX_DESCRIPTION = 4000;
+const MAX_UPDATE_BODY = 1000;
 
 if (!DISCORD_WEBHOOK_URL) {
   console.error("ERROR: DISCORD_WEBHOOK_URL environment variable is not configured.");
   process.exit(1);
 }
 
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception, exiting:", error);
+  process.exit(1);
+});
+
 let previousState = null;
+let checkInProgress = false;
+
 let latestStatus = {
   checkedAt: null,
   overall: null,
@@ -24,6 +47,25 @@ let latestStatus = {
   error: null,
   initialized: false
 };
+
+let discordStatus = {
+  lastSuccessAt: null,
+  lastErrorAt: null,
+  lastError: null,
+  consecutiveFailures: 0
+};
+
+function truncate(text, max) {
+  const value = String(text ?? "");
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+function webhookUrl() {
+  // Handles webhook URLs that already include a query string (e.g. ?thread_id=).
+  const url = new URL(DISCORD_WEBHOOK_URL);
+  url.searchParams.set("wait", "true");
+  return url.toString();
+}
 
 function normalizeStatus(data) {
   return {
@@ -44,6 +86,7 @@ function normalizeStatus(data) {
         name: incident.name,
         status: incident.status,
         impact: incident.impact,
+        shortlink: incident.shortlink ?? null,
         updatedAt: incident.updated_at,
         latestUpdateId: incident.incident_updates?.[0]?.id ?? null,
         latestUpdate: incident.incident_updates?.[0]?.body ?? null
@@ -63,26 +106,35 @@ function normalizeStatus(data) {
   };
 }
 
-async function fetchCloudwaysStatus() {
+async function fetchWithTimeout(url, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const response = await fetch(STATUS_URL, {
-      headers: {
-        "User-Agent": "cloudways-status-discord/1.0.0"
-      },
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`Cloudways API returned HTTP ${response.status}`);
-    }
-
-    return await response.json();
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function fetchCloudwaysStatus() {
+  const response = await fetchWithTimeout(STATUS_URL, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      Accept: "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Cloudways API returned HTTP ${response.status}`);
+  }
+
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("json")) {
+    throw new Error(`Cloudways API returned non-JSON content (${contentType})`);
+  }
+
+  return await response.json();
 }
 
 function detectChanges(previous, current) {
@@ -102,12 +154,8 @@ function detectChanges(previous, current) {
     previous.components.map((component) => [component.id, component])
   );
 
-  const currentComponents = new Map(
-    current.components.map((component) => [component.id, component])
-  );
-
-  for (const [id, component] of currentComponents) {
-    const old = previousComponents.get(id);
+  for (const component of current.components) {
+    const old = previousComponents.get(component.id);
 
     if (old && old.status !== component.status) {
       changes.push({
@@ -122,7 +170,6 @@ function detectChanges(previous, current) {
   const previousIncidents = new Map(
     previous.incidents.map((incident) => [incident.id, incident])
   );
-
   const currentIncidents = new Map(
     current.incidents.map((incident) => [incident.id, incident])
   );
@@ -131,10 +178,7 @@ function detectChanges(previous, current) {
     const old = previousIncidents.get(id);
 
     if (!old) {
-      changes.push({
-        type: "incident_created",
-        incident
-      });
+      changes.push({ type: "incident_created", incident });
       continue;
     }
 
@@ -153,17 +197,13 @@ function detectChanges(previous, current) {
 
   for (const [id, incident] of previousIncidents) {
     if (!currentIncidents.has(id)) {
-      changes.push({
-        type: "incident_resolved",
-        incident
-      });
+      changes.push({ type: "incident_resolved", incident });
     }
   }
 
   const previousMaintenance = new Map(
     previous.maintenance.map((item) => [item.id, item])
   );
-
   const currentMaintenance = new Map(
     current.maintenance.map((item) => [item.id, item])
   );
@@ -172,10 +212,7 @@ function detectChanges(previous, current) {
     const old = previousMaintenance.get(id);
 
     if (!old) {
-      changes.push({
-        type: "maintenance_created",
-        maintenance: item
-      });
+      changes.push({ type: "maintenance_created", maintenance: item });
       continue;
     }
 
@@ -184,19 +221,35 @@ function detectChanges(previous, current) {
       old.impact !== item.impact ||
       old.updatedAt !== item.updatedAt
     ) {
-      changes.push({
-        type: "maintenance_updated",
-        maintenance: item
-      });
+      changes.push({ type: "maintenance_updated", maintenance: item });
     }
   }
 
   for (const [id, item] of previousMaintenance) {
     if (!currentMaintenance.has(id)) {
-      changes.push({
-        type: "maintenance_removed",
-        maintenance: item
-      });
+      changes.push({ type: "maintenance_removed", maintenance: item });
+    }
+  }
+
+  return changes;
+}
+
+// Used once at startup: turns recently updated items into alerts so a
+// restart does not swallow an incident that started during downtime.
+function recentItemsAsChanges(state) {
+  const cutoff = Date.now() - STARTUP_LOOKBACK_MS;
+  const isRecent = (iso) => Boolean(iso) && Date.parse(iso) >= cutoff;
+  const changes = [];
+
+  for (const incident of state.incidents) {
+    if (isRecent(incident.updatedAt)) {
+      changes.push({ type: "incident_updated", incident });
+    }
+  }
+
+  for (const item of state.maintenance) {
+    if (isRecent(item.updatedAt)) {
+      changes.push({ type: "maintenance_updated", maintenance: item });
     }
   }
 
@@ -205,7 +258,7 @@ function detectChanges(previous, current) {
 
 function severityForChanges(changes) {
   if (changes.some((c) =>
-    c.type === "incident_created" &&
+    (c.type === "incident_created" || c.type === "incident_updated") &&
     ["critical", "major"].includes(c.incident.impact)
   )) {
     return "critical";
@@ -243,10 +296,7 @@ function titleForChanges(changes) {
     return "⚠️ Cloudways Component Status Change";
   }
 
-  if (changes.some((c) =>
-    c.type === "maintenance_created" ||
-    c.type === "maintenance_updated"
-  )) {
+  if (changes.some((c) => c.type.startsWith("maintenance_"))) {
     return "🛠️ Cloudways Maintenance Update";
   }
 
@@ -259,67 +309,117 @@ function statusLabel(status) {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
+function quote(text) {
+  return truncate(text, MAX_UPDATE_BODY)
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
 function buildDescription(changes) {
   const lines = [];
 
   for (const change of changes.slice(0, 10)) {
-    if (change.type === "overall") {
-      lines.push(
-        `**Overall status:** ${statusLabel(change.previous)} → **${statusLabel(change.current)}**`
-      );
-    }
+    switch (change.type) {
+      case "overall":
+        lines.push(
+          `**Overall status:** ${statusLabel(change.previous)} → **${statusLabel(change.current)}**`
+        );
+        break;
 
-    if (change.type === "component") {
-      lines.push(
-        `**${change.name}** — ${statusLabel(change.previous)} → **${statusLabel(change.current)}**`
-      );
-    }
+      case "component":
+        lines.push(
+          `**${change.name}:** ${statusLabel(change.previous)} → **${statusLabel(change.current)}**`
+        );
+        break;
 
-    if (change.type === "incident_created") {
-      const incident = change.incident;
-      lines.push(
-        `**${incident.name}**\nStatus: **${statusLabel(incident.status)}** · Impact: **${statusLabel(incident.impact)}**`
-      );
-
-      if (incident.latestUpdate) {
-        lines.push(`> ${incident.latestUpdate}`);
+      case "incident_created":
+      case "incident_updated": {
+        const incident = change.incident;
+        const link = incident.shortlink ? `\n${incident.shortlink}` : "";
+        lines.push(
+          `**${incident.name}**\nStatus: **${statusLabel(incident.status)}** · Impact: **${statusLabel(incident.impact)}**${link}`
+        );
+        if (incident.latestUpdate) {
+          lines.push(quote(incident.latestUpdate));
+        }
+        break;
       }
-    }
 
-    if (change.type === "incident_updated") {
-      const incident = change.incident;
-      lines.push(
-        `**${incident.name}**\nStatus: **${statusLabel(incident.status)}** · Impact: **${statusLabel(incident.impact)}**`
-      );
+      case "incident_resolved":
+        lines.push(`**${change.incident.name}** has been resolved.`);
+        break;
 
-      if (incident.latestUpdate) {
-        lines.push(`> ${incident.latestUpdate}`);
+      case "maintenance_created":
+      case "maintenance_updated": {
+        const item = change.maintenance;
+        lines.push(
+          `**${item.name}**\nStatus: **${statusLabel(item.status)}** · Impact: **${statusLabel(item.impact)}**`
+        );
+        break;
       }
-    }
 
-    if (change.type === "incident_resolved") {
-      lines.push(`**${change.incident.name}** has been resolved.`);
-    }
-
-    if (change.type === "maintenance_created" ||
-        change.type === "maintenance_updated") {
-      const item = change.maintenance;
-      lines.push(
-        `**${item.name}**\nStatus: **${statusLabel(item.status)}** · Impact: **${statusLabel(item.impact)}**`
-      );
+      case "maintenance_removed":
+        lines.push(`**${change.maintenance.name}** is no longer listed as scheduled maintenance.`);
+        break;
     }
   }
 
   if (changes.length > 10) {
-    lines.push(`\n…and ${changes.length - 10} additional changes.`);
+    lines.push(`…and ${changes.length - 10} additional changes.`);
   }
 
-  return lines.join("\n\n");
+  // Discord rejects embeds with an empty description.
+  const description = lines.join("\n\n") ||
+    "The Cloudways status page was updated. See the status page for details.";
+
+  return truncate(description, MAX_DESCRIPTION);
 }
 
-async function sendDiscordAlert(changes) {
-  const severity = severityForChanges(changes);
+async function postToDiscord(payload, attempt = 1) {
+  const response = await fetchWithTimeout(webhookUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": USER_AGENT
+    },
+    body: JSON.stringify(payload)
+  });
 
+  if (response.status === 429 && attempt < 3) {
+    const body = await response.json().catch(() => ({}));
+    const waitMs = Math.ceil((Number(body.retry_after) || 2) * 1000);
+    console.warn(`Discord rate limited, retrying in ${waitMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    return postToDiscord(payload, attempt + 1);
+  }
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(
+      `Discord webhook returned HTTP ${response.status}: ${truncate(body, 500)}`
+    );
+  }
+}
+
+function recordDiscordResult(error) {
+  if (error) {
+    discordStatus = {
+      ...discordStatus,
+      lastErrorAt: new Date().toISOString(),
+      lastError: error instanceof Error ? error.message : String(error),
+      consecutiveFailures: discordStatus.consecutiveFailures + 1
+    };
+  } else {
+    discordStatus = {
+      ...discordStatus,
+      lastSuccessAt: new Date().toISOString(),
+      consecutiveFailures: 0
+    };
+  }
+}
+
+async function sendDiscordAlert(changes, { catchUp = false } = {}) {
   const colors = {
     critical: 0xED4245,
     warning: 0xFEE75C,
@@ -327,50 +427,48 @@ async function sendDiscordAlert(changes) {
     info: 0x5865F2
   };
 
+  const fields = [
+    {
+      name: "Detected",
+      value: `<t:${Math.floor(Date.now() / 1000)}:F>`,
+      inline: true
+    },
+    {
+      name: "Monitor",
+      value: catchUp ? "Detected on monitor startup" : "Cloudways Status API",
+      inline: true
+    }
+  ];
+
   const payload = {
     username: "Cloudways Status",
     embeds: [
       {
         title: titleForChanges(changes),
         description: buildDescription(changes),
-        color: colors[severity],
+        color: colors[severityForChanges(changes)],
         url: "https://status.cloudways.com/",
-        fields: [
-          {
-            name: "Detected",
-            value: `<t:${Math.floor(Date.now() / 1000)}:F>`,
-            inline: true
-          },
-          {
-            name: "Monitor",
-            value: "Cloudways Status API",
-            inline: true
-          }
-        ],
-        footer: {
-          text: "Cloudways Status Monitor"
-        }
+        fields,
+        footer: { text: "Cloudways Status Monitor" }
       }
     ],
-    allowed_mentions: {
-      parse: []
-    }
+    allowed_mentions: { parse: [] }
   };
 
-  const response = await fetch(`${DISCORD_WEBHOOK_URL}?wait=true`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "cloudways-status-discord/1.0.0"
-    },
-    body: JSON.stringify(payload)
-  });
+  await postToDiscord(payload);
+}
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(
-      `Discord webhook returned HTTP ${response.status}: ${body}`
-    );
+async function notify(changes, options) {
+  try {
+    await sendDiscordAlert(changes, options);
+    recordDiscordResult(null);
+    console.log("Discord alert sent successfully.");
+  } catch (error) {
+    recordDiscordResult(error);
+    console.error("Discord alert failed:", discordStatus.lastError);
+    // State still advances so a Discord outage does not cause repeated
+    // notifications for the same status on every poll. Failures are now
+    // visible on /health instead of being silent.
   }
 }
 
@@ -386,8 +484,6 @@ async function checkCloudwaysStatus() {
       initialized: true
     };
 
-    // First successful check establishes the baseline.
-    // This prevents existing incidents from immediately spamming Discord.
     if (previousState === null) {
       previousState = currentState;
 
@@ -397,40 +493,28 @@ async function checkCloudwaysStatus() {
       console.log(
         `Components: ${currentState.components.length} | Incidents: ${currentState.incidents.length} | Maintenance: ${currentState.maintenance.length}`
       );
+
+      const recent = recentItemsAsChanges(currentState);
+      if (recent.length > 0) {
+        console.log(`${recent.length} recently updated item(s) found on startup, announcing.`);
+        await notify(recent, { catchUp: true });
+      }
       return;
     }
 
     const changes = detectChanges(previousState, currentState);
 
     if (changes.length === 0) {
-      console.log(
-        `[${latestStatus.checkedAt}] No changes. Overall: ${currentState.overall}`
-      );
+      console.log(`[${latestStatus.checkedAt}] No changes. Overall: ${currentState.overall}`);
       return;
     }
 
-    console.log(
-      `[${latestStatus.checkedAt}] ${changes.length} status change(s) detected.`
-    );
-
+    console.log(`[${latestStatus.checkedAt}] ${changes.length} status change(s) detected.`);
     for (const change of changes) {
       console.log(JSON.stringify(change));
     }
 
-    try {
-      await sendDiscordAlert(changes);
-      console.log("Discord alert sent successfully.");
-    } catch (discordError) {
-      console.error(
-        "Discord alert failed:",
-        discordError instanceof Error
-          ? discordError.message
-          : String(discordError)
-      );
-      // Keep the state updated so a Discord outage does not cause
-      // repeated notifications for the same status on every poll.
-    }
-
+    await notify(changes);
     previousState = currentState;
   } catch (error) {
     latestStatus = {
@@ -446,6 +530,25 @@ async function checkCloudwaysStatus() {
   }
 }
 
+// setTimeout chain instead of setInterval so a slow check (timeouts,
+// rate-limit retries) never overlaps with the next one.
+async function pollLoop() {
+  if (!checkInProgress) {
+    checkInProgress = true;
+    try {
+      await checkCloudwaysStatus();
+    } finally {
+      checkInProgress = false;
+    }
+  }
+  setTimeout(pollLoop, POLL_INTERVAL_MS);
+}
+
+function isStale() {
+  if (!latestStatus.checkedAt) return true;
+  return Date.now() - Date.parse(latestStatus.checkedAt) > POLL_INTERVAL_MS * 4;
+}
+
 app.get("/", (_req, res) => {
   res.json({
     service: "Cloudways Status Monitor",
@@ -458,95 +561,65 @@ app.get("/", (_req, res) => {
 });
 
 app.get("/health", (_req, res) => {
-  res.status(latestStatus.error ? 503 : 200).json({
-    status: latestStatus.error ? "degraded" : "ok",
+  const problems = [];
+  if (latestStatus.error) problems.push(`status check: ${latestStatus.error}`);
+  if (isStale()) problems.push("polling loop is stale");
+  if (discordStatus.consecutiveFailures > 0) problems.push(`discord: ${discordStatus.lastError}`);
+
+  res.status(problems.length ? 503 : 200).json({
+    status: problems.length ? "degraded" : "ok",
+    problems,
     lastCheck: latestStatus.checkedAt,
-    error: latestStatus.error
+    discord: discordStatus,
+    uptimeSeconds: Math.round(process.uptime())
   });
 });
 
 app.get("/status", (_req, res) => {
-  res.json(latestStatus);
+  res.json({ ...latestStatus, discord: discordStatus });
 });
 
-app.get("/test-discord", async (_req, res) => {
+app.get("/test-discord", async (req, res) => {
+  if (TEST_TOKEN && req.query.token !== TEST_TOKEN) {
+    return res.status(401).json({ success: false, error: "Invalid or missing token" });
+  }
+
   try {
-    const testPayload = {
+    await postToDiscord({
       username: "Cloudways Status",
       embeds: [
         {
           title: "🧪 Cloudways Status Monitor Test",
-          description:
-            "Discord webhook is working correctly. This is a temporary test notification.",
-          color: 0x5865f2,
+          description: "Discord webhook is working correctly. This is a temporary test notification.",
+          color: 0x5865F2,
           fields: [
-            {
-              name: "Monitor",
-              value: "Online",
-              inline: true
-            },
-            {
-              name: "Cloudways Status",
-              value: latestStatus.overall ?? "Unknown",
-              inline: true
-            },
-            {
-              name: "Poll Interval",
-              value: "30 seconds",
-              inline: true
-            }
+            { name: "Monitor", value: "Online", inline: true },
+            { name: "Cloudways Status", value: latestStatus.overall ?? "Unknown", inline: true },
+            { name: "Poll Interval", value: `${POLL_INTERVAL_MS / 1000} seconds`, inline: true }
           ],
-          footer: {
-            text: "Cloudways Status Monitor"
-          },
+          footer: { text: "Cloudways Status Monitor" },
           timestamp: new Date().toISOString()
         }
       ],
-      allowed_mentions: {
-        parse: []
-      }
-    };
-
-    const response = await fetch(`${DISCORD_WEBHOOK_URL}?wait=true`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "cloudways-status-discord/1.0.0"
-      },
-      body: JSON.stringify(testPayload)
+      allowed_mentions: { parse: [] }
     });
 
-    if (!response.ok) {
-      const body = await response.text();
-
-      return res.status(502).json({
-        success: false,
-        error: `Discord returned HTTP ${response.status}`,
-        details: body
-      });
-    }
-
+    recordDiscordResult(null);
     res.json({
       success: true,
       message: "Test Discord notification sent.",
       cloudwaysStatus: latestStatus.overall
     });
   } catch (error) {
-    console.error("Test Discord notification failed:", error);
-
-    res.status(500).json({
-      success: false,
-      error: error instanceof Error ? error.message : String(error)
-    });
+    recordDiscordResult(error);
+    console.error("Test Discord notification failed:", discordStatus.lastError);
+    res.status(502).json({ success: false, error: discordStatus.lastError });
   }
 });
 
-app.listen(PORT, "0.0.0.0", async () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Cloudways Status Monitor started on port ${PORT}`);
   console.log(`Polling Cloudways every ${POLL_INTERVAL_MS / 1000} seconds`);
-  console.log("Discord notifications: enabled");
-
-  await checkCloudwaysStatus();
-
-  setInterval(checkCloudwaysStatus, POLL_INTERVAL_MS);
+  console.log(`Startup lookback: ${STARTUP_LOOKBACK_MS / 60_000} minutes`);
+  pollLoop();
 });
